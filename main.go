@@ -134,6 +134,9 @@ func setupGinHandlers() *gin.Engine {
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "Gin + Lambda + S3 CRUD API"})
 	})
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"message": "Test Success"})
+	})
 
 	// Example routes (you can expand these or use API Gateway proxy)
 	// Normally you'd use API Gateway for Lambda, but here's how you'd structure them in Gin:
