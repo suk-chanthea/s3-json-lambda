@@ -180,7 +180,7 @@ func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.API
 		return clientError(400, "Missing 'action' or 'filename'"), nil
 	}
 
-	s3Key := buildS3Key(input.Filename)
+	s3Key := "data/" + buildS3Key(input.Filename)
 
 	switch input.Action {
 	case "get":
