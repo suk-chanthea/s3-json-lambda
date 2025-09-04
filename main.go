@@ -5,184 +5,271 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"log"
+	"os"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/awslabs/aws-lambda-go-api-proxy/gin"
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 )
 
-// Message represents a single message (NO filename field inside JSON)
+// ======================
+// 📦 Types
+// ======================
+
 type Message struct {
-	Sender    string `json:"sender"`
-	Receiver  string `json:"receiver"`
-	Message   string `json:"message"`
-	Date      string `json:"date"`
+	ID       int    `json:"id"`
+	Sender   string `json:"sender" binding:"required"`
+	Receiver string `json:"receiver" binding:"required"`
+	Message  string `json:"message" binding:"required"`
+	Date     string `json:"date" binding:"required"`
 }
 
 type AllMessages []Message
 
-var bucketName = "https://mongkol.s3.ap-southeast-1.amazonaws.com/data" // ✅ REPLACE with your real S3 bucket
+// ======================
+// 🌍 Env & S3 Setup
+// ======================
 
-// buildS3Key: filename=file1 → file1.json
-func buildS3Key(filenameParam string) string {
-	clean := strings.TrimSpace(filenameParam)
-	if clean == "" {
-		clean = "default"
+var (
+	bucketName string
+	ginLambda  *ginadapter.GinLambda
+)
+
+func init() {
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Println("⚠️ .env file not found, using OS environment variables")
 	}
-	return clean + ".json"
+
+	bucketName = os.Getenv("S3_BUCKET_NAME")
+	if bucketName == "" {
+		log.Fatalf("❌ S3_BUCKET_NAME environment variable not set")
+	}
 }
 
-// getS3JSON: fetch JSON array from S3 file (e.g. file1.json)
-func getS3JSON(ctx context.Context, s3Key string) (AllMessages, error) {
-	cfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("unable to load SDK config: %v", err)
-	}
+func buildS3Key(filename string) string {
+	return filename + ".json"
+}
 
+// ======================
+// 📤 S3: Get JSON
+// ======================
+
+func getS3JSON(ctx context.Context, cfg aws.Config, s3Key string) (AllMessages, error) {
 	s3Client := s3.NewFromConfig(cfg)
 
-	// Check if object exists
-	_, err = s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+	_, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(s3Key),
 	})
-
 	if err != nil {
 		if isS3NotFoundErr(err) {
-			// File does not exist yet → return empty array
-			return []Message{}, nil
+			return []Message{}, nil // File not found → return empty array
 		}
-		return nil, fmt.Errorf("failed to head S3 object: %v", err)
+		return nil, fmt.Errorf("head failed: %v", err)
 	}
 
-	// Fetch the file
 	resp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(s3Key),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get S3 object: %v", err)
+		return nil, fmt.Errorf("get failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	var messages AllMessages
 	if err := json.NewDecoder(resp.Body).Decode(&messages); err != nil {
-		return nil, fmt.Errorf("failed to decode JSON: %v", err)
+		return nil, fmt.Errorf("decode failed: %v", err)
 	}
 
 	return messages, nil
 }
 
-// isS3NotFoundErr: rough check for "file not found"
-func isS3NotFoundErr(err error) bool {
-	return err != nil && (err.Error() == "NotFound" || err.Error() == "no such key" || err.Error() == "Not Found" || err.Error() == "s3.ErrCodeNoSuchKey")
-}
+// ======================
+// 📥 S3: Save JSON
+// ======================
 
-// putS3JSON: save JSON array back to S3 file
-func putS3JSON(ctx context.Context, s3Key string, messages AllMessages) error {
-	cfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		return fmt.Errorf("unable to load SDK config: %v", err)
-	}
-
+func putS3JSON(ctx context.Context, cfg aws.Config, s3Key string, messages AllMessages) error {
 	s3Client := s3.NewFromConfig(cfg)
 
-	jsonData, err := json.MarshalIndent(messages, "", "  ")
+	data, err := json.MarshalIndent(messages, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %v", err)
+		return fmt.Errorf("marshal failed: %v", err)
 	}
 
 	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(s3Key),
-		Body:   bytes.NewReader(jsonData),
+		Body:   bytes.NewReader(data),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to put S3 object: %v", err)
+		return fmt.Errorf("put failed: %v", err)
 	}
 
 	return nil
 }
 
-// Handler: GET or UPDATE messages in fileX.json
-func Handler(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	action := request.QueryStringParameters["action"]
-	if action == "" {
-		return clientError(400, "Missing 'action' parameter (use 'get' or 'update')")
+// ======================
+// ❓ S3: Is Not Found?
+// ======================
+
+func isS3NotFoundErr(err error) bool {
+	return err != nil && (err.Error() == "NotFound" || err.Error() == "no such key" || err.Error() == "s3.ErrCodeNoSuchKey")
+}
+
+// ======================
+// 🧩 Gin Handlers (Normal Mode)
+// ======================
+
+func setupGinHandlers() *gin.Engine {
+	r := gin.Default()
+
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(200, gin.H{"message": "Gin + Lambda + S3 CRUD API"})
+	})
+
+	// Example routes (you can expand these or use API Gateway proxy)
+	// Normally you'd use API Gateway for Lambda, but here's how you'd structure them in Gin:
+	// r.GET("/messages", getMessagesHandler)
+	// r.POST("/messages?filename=file1", addMessageHandler)
+	// etc.
+
+	return r
+}
+
+// ======================
+// 🧠 Lambda Handler (API Gateway Proxy)
+// ======================
+
+type APIRequest struct {
+	Action   string `json:"action"`   // "get", "add", "update", "delete"
+	Filename string `json:"filename"` // → file1.json
+	// For ADD:
+	Sender   string `json:"sender,omitempty"`
+	Receiver string `json:"receiver,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Date     string `json:"date,omitempty"`
+	// For UPDATE / DELETE: you can add "id" or "index"
+	ID int `json:"id,omitempty"` // Used to update/delete specific item
+}
+
+type APIResponse struct {
+	Status  string      `json:"status,omitempty"`
+	Data    interface{} `json:"data,omitempty"`
+	Message string      `json:"message,omitempty"`
+}
+
+func Handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	// Parse body
+	var input APIRequest
+	if err := json.Unmarshal([]byte(req.Body), &input); err != nil {
+		return clientError(400, "Invalid JSON body"), nil
 	}
 
-	filenameParam := request.QueryStringParameters["filename"]
-	if filenameParam == "" {
-		return clientError(400, "Missing 'filename' parameter")
+	if input.Action == "" || input.Filename == "" {
+		return clientError(400, "Missing 'action' or 'filename'"), nil
 	}
 
-	s3Key := buildS3Key(filenameParam)
+	s3Key := buildS3Key(input.Filename)
 
-	switch action {
+	switch input.Action {
 	case "get":
-		messages, err := getS3JSON(ctx, s3Key)
+		messages, err := getS3JSON(ctx, cfg, s3Key)
 		if err != nil {
-			return clientError(500, fmt.Sprintf("Failed to get messages: %v", err))
+			return clientError(500, fmt.Sprintf("Get failed: %v", err)), nil
 		}
-		jsonData, err := json.Marshal(messages)
+		return successResponse(messages), nil
+
+	case "add":
+		if input.Sender == "" || input.Receiver == "" || input.Message == "" || input.Date == "" {
+			return clientError(400, "Missing fields for add: sender, receiver, message, date"), nil
+		}
+
+		messages, err := getS3JSON(ctx, cfg, s3Key)
 		if err != nil {
-			return clientError(500, fmt.Sprintf("Failed to marshal: %v", err))
+			return clientError(500, fmt.Sprintf("Get failed: %v", err)), nil
 		}
-		return events.APIGatewayProxyResponse{
-			StatusCode: 200,
-			Body:       string(jsonData),
-			Headers:    map[string]string{"Content-Type": "application/json"},
-		}, nil
+
+		newID := 1
+		if len(messages) > 0 {
+			newID = messages[len(messages)-1].ID + 1
+		}
+
+		newMsg := Message{
+			ID:       newID,
+			Sender:   input.Sender,
+			Receiver: input.Receiver,
+			Message:  input.Message,
+			Date:     input.Date,
+		}
+
+		messages = append(messages, newMsg)
+		if err := putS3JSON(ctx, cfg, s3Key, messages); err != nil {
+			return clientError(500, fmt.Sprintf("Save failed: %v", err)), nil
+		}
+
+		return successResponse(newMsg), nil
 
 	case "update":
-		sender := request.QueryStringParameters["sender"]
-		receiver := request.QueryStringParameters["receiver"]
-		msg := request.QueryStringParameters["message"]
-		date := request.QueryStringParameters["date"]
+		// TODO: Find message by ID and update fields
+		return clientError(501, "Update not implemented yet"), nil
 
-		if sender == "" || receiver == "" || msg == "" || date == "" {
-			return clientError(400, "Missing required fields for update: sender, receiver, message, date")
-		}
-
-		messages, err := getS3JSON(ctx, s3Key)
-		if err != nil {
-			return clientError(500, fmt.Sprintf("Failed to retrieve existing messages: %v", err))
-		}
-
-		newMessage := Message{
-			Sender:   sender,
-			Receiver: receiver,
-			Message:  msg,
-			Date:     date,
-		}
-		messages = append(messages, newMessage)
-
-		if err := putS3JSON(ctx, s3Key, messages); err != nil {
-			return clientError(500, fmt.Sprintf("Failed to save messages: %v", err))
-		}
-
-		return events.APIGatewayProxyResponse{
-			StatusCode: 200,
-			Body:       `{"status": "updated"}`,
-			Headers:    map[string]string{"Content-Type": "application/json"},
-		}, nil
+	case "delete":
+		// TODO: Find message by ID and remove it
+		return clientError(501, "Delete not implemented yet"), nil
 
 	default:
-		return clientError(400, "Invalid action. Use 'get' or 'update'")
+		return clientError(400, "Invalid action. Use: get, add, update, delete"), nil
+	}
+}
+// ======================
+// 🧩 Helpers
+// ======================
+
+func successResponse(data interface{}) events.APIGatewayProxyResponse {
+	return events.APIGatewayProxyResponse{
+		StatusCode: 200,
+		Body:       toJson(data),
+		Headers:    map[string]string{"Content-Type": "application/json"},
 	}
 }
 
-func clientError(status int, body string) (events.APIGatewayProxyResponse, error) {
+func clientError(status int, msg string) events.APIGatewayProxyResponse {
 	return events.APIGatewayProxyResponse{
 		StatusCode: status,
-		Body:       `{ "error": "` + body + `" }`,
+		Body:       toJson(map[string]string{"error": msg}),
 		Headers:    map[string]string{"Content-Type": "application/json"},
-	}, nil
+	}
 }
 
+func toJson(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+var cfg aws.Config
+
 func main() {
-	lambda.Start(Handler)
+	var err error
+	cfg, err = config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		log.Fatalf("❌ AWS config error: %v", err)
+	}
+
+	// ✅ Detect: running on Lambda or locally?
+	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+		// Lambda mode
+		lambda.Start(Handler)
+	} else {
+		// Local mode: run Gin HTTP server
+		r := setupGinHandlers()
+		r.Run(":8080")
+	}
 }
